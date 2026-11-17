@@ -1,0 +1,8 @@
+[Unit]
+Description=Сторож Wi-Fi роутера: пробное подключение, при сбое перезагрузка роутера
+After=NetworkManager.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wifi-watchdog
+TimeoutStartSec=240

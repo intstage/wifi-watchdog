@@ -1,0 +1,83 @@
+#!/bin/bash
+# wifi-watchdog-setup — владелец вводит пароль Wi-Fi и пароль администратора роутера.
+# Запуск: sudo wifi-watchdog-setup [ИМЯ_СЕТИ]   (по сети: ssh -t сервер sudo wifi-watchdog-setup)
+# Пароли не показываются и не попадают в журнал. Wi-Fi хранится в виде ключа (не открытым текстом)
+# в /etc/NetworkManager/system-connections/wifi-probe.nmconnection, пароль роутера —
+# в /etc/wifi-watchdog/router-password (оба root, 600).
+set -u
+[ "$(id -u)" -eq 0 ] || { echo "Запустите через sudo"; exit 1; }
+IFACE=wlan0
+PROFILE=wifi-probe
+ROUTER_IP=192.168.0.1
+umask 077
+mkdir -p /etc/wifi-watchdog
+[ -r /etc/wifi-watchdog/config ] && . /etc/wifi-watchdog/config
+export ROUTER_URL="http://$ROUTER_IP"
+ip link show "$IFACE" >/dev/null 2>&1 || { echo "Нет Wi-Fi-адаптера $IFACE — укажите свой в /etc/wifi-watchdog/config (IFACE=…)"; exit 1; }
+
+# Имя сети: аргумент, иначе из уже созданного профиля, иначе спросить
+SSID=${1:-$(nmcli -g 802-11-wireless.ssid con show "$PROFILE" 2>/dev/null)}
+[ -n "$SSID" ] || read -rp "Имя сети Wi-Fi (SSID): " SSID
+[ -n "$SSID" ] || { echo "Имя сети не задано"; exit 1; }
+
+echo "== 1/2. Wi-Fi сети «$SSID» =="
+read -rsp "Пароль Wi-Fi (Enter — пропустить): " WPW; echo
+if [ -n "$WPW" ]; then
+  PSK=$(printf '%s' "$WPW" | SSID="$SSID" python3 -c '
+import hashlib, os, sys
+p = sys.stdin.buffer.read()
+if not 8 <= len(p) <= 63: sys.exit("длина пароля Wi-Fi должна быть 8–63 знака")
+print(hashlib.pbkdf2_hmac("sha1", p, os.environ["SSID"].encode(), 4096, 32).hex())') || exit 1
+  unset WPW
+  F=/etc/NetworkManager/system-connections/$PROFILE.nmconnection
+  cat > "$F" <<EOF
+[connection]
+id=$PROFILE
+type=wifi
+interface-name=$IFACE
+autoconnect=false
+
+[wifi]
+mode=infrastructure
+ssid=$SSID
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=$PSK
+
+[ipv4]
+method=auto
+never-default=true
+ignore-auto-dns=true
+route-metric=900
+dhcp-timeout=25
+
+[ipv6]
+method=disabled
+EOF
+  chmod 600 "$F"
+  nmcli con reload
+  echo "Пробую подключиться…"
+  if /usr/local/sbin/wifi-watchdog --probe; then echo "✅ Wi-Fi: пароль подошёл"; else echo "❌ Wi-Fi: подключиться не удалось — проверьте пароль и запустите ещё раз"; fi
+fi
+
+echo
+echo "== 2/2. Администратор роутера ($ROUTER_IP) =="
+read -rsp "Пароль администратора (Enter — пропустить): " RPW; echo
+if [ -n "$RPW" ]; then
+  printf '%s' "$RPW" > /etc/wifi-watchdog/router-password
+  unset RPW
+  chmod 600 /etc/wifi-watchdog/router-password
+  rm -f /etc/wifi-watchdog/router-client
+  echo "Пробую войти в роутер (если вы открыты в его веб-интерфейсе — вас оттуда выкинет)…"
+  if out=$(/usr/local/lib/wifi-watchdog/router.py check 2>&1); then
+    echo "$out"
+    sed -n 's/^клиент=//p' <<<"$out" > /etc/wifi-watchdog/router-client
+    echo "✅ Роутер: вход работает"
+  else
+    echo "$out" | tail -3
+    echo "❌ Роутер: войти не удалось. Не повторяйте много раз подряд — роутер блокирует вход после нескольких ошибок."
+  fi
+fi
+echo
+echo "Готово. Включить сторож: sudo systemctl enable --now wifi-watchdog.timer"

@@ -1,0 +1,126 @@
+#!/bin/bash
+# wifi-watchdog — сторож Wi-Fi домашнего роутера.
+# Сервер подключён к роутеру кабелем; своим Wi-Fi-адаптером он пробует войти в домашнюю сеть.
+# 3 неудачи подряд → перезапуск вещания Wi-Fi; не помогло → перезагрузка роутера (не больше 3 в сутки).
+# Запуск: wifi-watchdog          — один проход (его вызывает wifi-watchdog.timer)
+#         wifi-watchdog --probe  — только пробное подключение, без счётчиков и действий
+#         wifi-watchdog --status — состояние счётчиков
+#         wifi-watchdog --reboot-now | --wifi-restart-now — вручную перезагрузить роутер / перезапустить вещание
+set -u
+
+IFACE=wlan0                # Wi-Fi-адаптер сервера; свои значения — в /etc/wifi-watchdog/config
+PROFILE=wifi-probe
+ROUTER_IP=192.168.0.1
+FAILS_BEFORE_ACTION=3      # неудач подряд до первого действия
+WAIT_AFTER_WIFI_RESTART=150
+WAIT_AFTER_REBOOT=900
+MAX_REBOOTS_PER_DAY=3
+[ -r /etc/wifi-watchdog/config ] && . /etc/wifi-watchdog/config
+
+STATE=${WIFI_WATCHDOG_STATE_DIR:-/var/lib/wifi-watchdog}
+ROUTER=${WIFI_WATCHDOG_ROUTER_CMD:-/usr/local/lib/wifi-watchdog/router.py}
+export ROUTER_URL="http://$ROUTER_IP"
+mkdir -p "$STATE"
+
+# на экран — только при ручном запуске: под systemd вывод и так попал бы в журнал второй раз
+log()  { logger -t wifi-watchdog -- "$*"; [ -t 1 ] && echo "$*"; return 0; }
+warn() { logger -p daemon.warning -t wifi-watchdog -- "$*"; [ -t 1 ] && echo "$*"; return 0; }
+get()  { cat "$STATE/$1" 2>/dev/null || echo "${2:-0}"; }
+put()  { echo "$2" > "$STATE/$1"; }
+
+reboots_last_day() {
+  local since=$(( $(date +%s) - 86400 ))
+  awk -v s="$since" '$1 >= s' "$STATE/reboots" 2>/dev/null | wc -l
+}
+
+# Пробное подключение. Коды: 0 — подключился, 1 — не подключился, 2 — проверить нельзя.
+probe() {
+  # для проверки логики без настоящего сбоя: WIFI_WATCHDOG_FAKE_PROBE=fail
+  [ "${WIFI_WATCHDOG_FAKE_PROBE:-}" = fail ] && { echo "имитация сбоя (тест)"; return 1; }
+  nmcli -t -f NAME con show | grep -qx "$PROFILE" || { echo "нет профиля $PROFILE (запустите wifi-watchdog-setup)"; return 2; }
+  local ssid; ssid=$(nmcli -g 802-11-wireless.ssid con show "$PROFILE")
+  # на время пробы у сервера два адреса в одной сети — пусть на ARP отвечает только кабель
+  sysctl -qw "net.ipv4.conf.$IFACE.arp_ignore=1" "net.ipv4.conf.$IFACE.arp_announce=2" 2>/dev/null
+  nmcli dev wifi rescan ifname "$IFACE" 2>/dev/null; sleep 5
+  local seen; seen=$(nmcli -t -f SSID dev wifi list ifname "$IFACE" 2>/dev/null | grep -v '^$')
+  if [ -z "$seen" ]; then echo "адаптер $IFACE не видит ни одной сети — дело в сервере, а не в роутере"; return 2; fi
+  if ! grep -Fxq -- "$ssid" <<<"$seen"; then echo "сеть $ssid не видна"; return 1; fi
+  local out rc
+  out=$(nmcli -w 45 con up "$PROFILE" ifname "$IFACE" 2>&1); rc=$?
+  nmcli con down "$PROFILE" >/dev/null 2>&1
+  if [ $rc -eq 0 ]; then echo "подключение к $ssid прошло"; return 0; fi
+  echo "сеть $ssid видна, но подключиться не удалось: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"; return 1
+}
+
+case "${1:-}" in
+  --probe)  probe; exit $? ;;
+  # Ручные команды (их удобно вешать на кнопку с другого компьютера). Действие уходит отдельной задачей systemd:
+  # при перезапуске Wi-Fi связь с Mac рвётся, а команда должна дойти до конца.
+  --reboot-now|--wifi-restart-now)
+    [ "$1" = --reboot-now ] && act=reboot || act=wifi-restart
+    ping -c 2 -W 2 -q "$ROUTER_IP" >/dev/null 2>&1 || { echo "роутер не отвечает серверу по кабелю"; exit 1; }
+    systemd-run --quiet --collect --unit="wifi-watchdog-manual-$(date +%s)" "$0" --do "$act" || { echo "не удалось запустить"; exit 1; }
+    echo "ok"; exit 0 ;;
+  --do)
+    act=${2:-}; now=$(date +%s)
+    case "$act" in reboot) pause=300 ;; wifi-restart) pause=120 ;; *) echo "неизвестное действие"; exit 1 ;; esac
+    warn "вручную: $act"
+    if out=$("$ROUTER" "$act" 2>&1); then
+      echo "$now $(date '+%F %T') $act" >> "$STATE/manual"
+      put fails 0; put stage 0; put backoff_until $(( now + pause ))   # сторож не вмешивается, пока роутер поднимается
+      log "вручную: $act — $out"; exit 0
+    fi
+    warn "ОШИБКА: вручную $act не прошло: $out"; exit 1 ;;
+  --status) echo "неудач подряд: $(get fails), этап: $(get stage), перезагрузок за сутки: $(reboots_last_day)"
+            b=$(get backoff_until); [ "$b" -gt "$(date +%s)" ] && echo "пауза до $(date -d "@$b" '+%H:%M:%S')"
+            exit 0 ;;
+esac
+
+now=$(date +%s)
+[ "$now" -lt "$(get backoff_until)" ] && exit 0
+
+if ! ping -c 2 -W 2 -q "$ROUTER_IP" >/dev/null 2>&1; then
+  log "роутер $ROUTER_IP не отвечает по кабелю — проверить Wi-Fi и перезагрузить нельзя"
+  exit 0
+fi
+
+msg=$(probe); rc=$?
+if [ $rc -eq 2 ]; then log "проверка пропущена: $msg"; exit 0; fi
+
+if [ $rc -eq 0 ]; then
+  if [ "$(get fails)" -gt 0 ] || [ "$(get stage)" -gt 0 ]; then log "Wi-Fi снова работает ($msg)"; fi
+  put fails 0; put stage 0; rm -f "$STATE/limit_reported"
+  exit 0
+fi
+
+fails=$(( $(get fails) + 1 )); put fails "$fails"
+warn "Wi-Fi не работает, неудача $fails подряд: $msg"
+[ "$fails" -lt "$FAILS_BEFORE_ACTION" ] && exit 0
+
+if [ "$(get stage)" -eq 0 ]; then
+  warn "перезапускаю вещание Wi-Fi на роутере"
+  if out=$("$ROUTER" wifi-restart 2>&1); then
+    put stage 1; put backoff_until $(( now + WAIT_AFTER_WIFI_RESTART )); exit 0
+  fi
+  warn "перезапуск вещания не удался: $out"
+  put stage 1   # сразу переходим к перезагрузке
+fi
+
+if [ "$(reboots_last_day)" -ge "$MAX_REBOOTS_PER_DAY" ]; then
+  if [ ! -e "$STATE/limit_reported" ]; then
+    touch "$STATE/limit_reported"
+    warn "ОШИБКА: Wi-Fi не работает, а предел $MAX_REBOOTS_PER_DAY перезагрузок роутера в сутки исчерпан — нужна ручная проверка"
+    exit 1   # служба станет failed — это видно в systemctl --failed и любом мониторинге
+  fi
+  exit 0
+fi
+
+warn "перезагружаю роутер"
+if out=$("$ROUTER" reboot 2>&1); then
+  echo "$now $(date '+%F %T')" >> "$STATE/reboots"
+  put fails 0; put stage 0; put backoff_until $(( now + WAIT_AFTER_REBOOT ))
+  exit 0
+fi
+warn "ОШИБКА: команда перезагрузки не прошла: $out"
+put backoff_until $(( now + 600 ))
+exit 1

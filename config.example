@@ -1,0 +1,7 @@
+# /etc/wifi-watchdog/config — необязательные настройки (синтаксис shell).
+IFACE=wlan0                 # Wi-Fi-адаптер сервера: ip -br link
+ROUTER_IP=192.168.0.1       # адрес роутера в домашней сети
+#FAILS_BEFORE_ACTION=3      # неудач подряд до первого действия (проверка раз в 3 минуты)
+#WAIT_AFTER_WIFI_RESTART=150
+#WAIT_AFTER_REBOOT=900
+#MAX_REBOOTS_PER_DAY=3
